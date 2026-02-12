@@ -4,17 +4,28 @@ Buffers messages between agents in SQLite. Provides HTTP endpoints for
 sending, receiving (with long-poll), and health checks. Also provides a
 CLI mode for sending messages without HTTP.
 
+Supports Ed25519 asymmetric identity verification: operators seed their
+keypair, register agents with public keys, and all messages are signed
+and verified. Security activates automatically when the first operator
+is seeded — before that, the system runs in open mode (backward compatible).
+
 Usage:
     Server mode:  python3 ipc-server.py serve [port]
-    Send mode:    python3 ipc-server.py send <channel> <from> <message>
-    Read mode:    python3 ipc-server.py read <channel> [--wait]
+    Send mode:    python3 ipc-server.py send <channel> <from> <message> [--key <keyfile>]
+    Read mode:    python3 ipc-server.py read <channel> <agent> [--wait]
     Channels:     python3 ipc-server.py channels
+    Seed:         python3 ipc-server.py seed <operator-name>
+    Keygen:       python3 ipc-server.py keygen [--out <prefix>]
+    Register:     python3 ipc-server.py register <name> --pubkey <file> --as <operator> --key <keyfile> [--identity <str>]
+    Agents:       python3 ipc-server.py agents
 
 Env vars:
     IPC_DB_PATH   - SQLite database path (default: /tmp/el-ipc.db)
     IPC_PORT      - Server port (default: 9876)
+    IPC_API_KEY   - Optional API key for HTTP auth (legacy, pre-identity)
 """
 
+import base64
 import json
 import os
 import sqlite3
@@ -22,12 +33,24 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import unquote
+
+# --- Optional crypto (graceful degradation) ---
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+    from cryptography.hazmat.primitives import serialization
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
 # --- Configuration ---
 
 DB_PATH = os.environ.get('IPC_DB_PATH', '/tmp/el-ipc.db')
 DEFAULT_PORT = int(os.environ.get('IPC_PORT', '9876'))
-API_KEY = os.environ.get('IPC_API_KEY', '')  # Set to require auth on HTTP endpoints
+API_KEY = os.environ.get('IPC_API_KEY', '')  # Legacy auth (pre-identity)
 
 # --- Database ---
 
@@ -56,18 +79,224 @@ def _get_db():
             PRIMARY KEY (agent, channel)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agents (
+            name          TEXT PRIMARY KEY,
+            identity      TEXT NOT NULL DEFAULT '',
+            public_key    TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'agent',
+            registered_by TEXT,
+            created_at    REAL NOT NULL
+        )
+    """)
+    # Migration: add signature column if missing
+    try:
+        conn.execute("SELECT signature FROM messages LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE messages ADD COLUMN signature TEXT DEFAULT ''")
     conn.commit()
     return conn
 
 
-def _send_message(channel, sender, content):
+# --- Identity / Crypto ---
+
+def _require_crypto(action):
+    if not HAS_CRYPTO:
+        print(f"Error: '{action}' requires the cryptography package.", file=sys.stderr)
+        print("Install it:  pip install cryptography", file=sys.stderr)
+        sys.exit(1)
+
+
+def _sign_payload(channel, sender, content):
+    """Canonical bytes to sign: channel\\nsender\\ncontent."""
+    return f"{channel}\n{sender}\n{content}".encode('utf-8')
+
+
+def _sign_message(channel, sender, content, private_key_pem):
+    """Sign a message. Returns base64-encoded Ed25519 signature."""
+    _require_crypto('sign')
+    private_key = serialization.load_pem_private_key(
+        private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem,
+        password=None,
+    )
+    payload = _sign_payload(channel, sender, content)
+    sig = private_key.sign(payload)
+    return base64.b64encode(sig).decode()
+
+
+def _verify_signature(channel, sender, content, signature_b64, public_key_pem):
+    """Verify a message signature against the sender's public key."""
+    _require_crypto('verify')
+    try:
+        public_key = serialization.load_pem_public_key(
+            public_key_pem.encode() if isinstance(public_key_pem, str) else public_key_pem
+        )
+        payload = _sign_payload(channel, sender, content)
+        sig = base64.b64decode(signature_b64)
+        public_key.verify(sig, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _is_secure_mode():
+    """Security is active once at least one operator exists."""
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM agents WHERE role = 'operator'").fetchone()
+        return row[0] > 0
+    finally:
+        conn.close()
+
+
+def _get_agent_pubkey(name):
+    """Look up an agent's public key. Returns (public_key_pem, role) or (None, None)."""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT public_key, role FROM agents WHERE name = ?", (name,)
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    finally:
+        conn.close()
+
+
+def _seed_operator(name):
+    """Generate Ed25519 keypair, register as operator. Returns private key PEM."""
+    _require_crypto('seed')
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+
+    with _db_lock:
+        conn = _get_db()
+        try:
+            existing = conn.execute(
+                "SELECT name FROM agents WHERE name = ?", (name,)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Agent '{name}' already exists")
+            conn.execute(
+                "INSERT INTO agents (name, public_key, role, created_at) VALUES (?, ?, 'operator', ?)",
+                (name, public_pem, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return private_pem, public_pem
+
+
+def _keygen():
+    """Generate an Ed25519 keypair. Returns (private_pem, public_pem)."""
+    _require_crypto('keygen')
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+
+    return private_pem, public_pem
+
+
+def _register_agent(agent_name, agent_pubkey_pem, identity_str, operator_name, operator_key_pem):
+    """Register a new agent, authorized by operator signature.
+
+    The operator signs: "register\\n{agent_name}\\n{identity}\\n{agent_pubkey_pem}"
+    This proves the operator authorized this specific registration.
+    """
+    _require_crypto('register')
+
+    # Look up operator
+    op_pubkey_pem, op_role = _get_agent_pubkey(operator_name)
+    if not op_pubkey_pem:
+        return False, f"Operator '{operator_name}' not found"
+    if op_role != 'operator':
+        return False, f"'{operator_name}' is not an operator (role: {op_role})"
+
+    # Build registration payload and sign with operator's private key
+    reg_payload = f"register\n{agent_name}\n{identity_str}\n{agent_pubkey_pem}".encode('utf-8')
+
+    operator_privkey = serialization.load_pem_private_key(
+        operator_key_pem.encode() if isinstance(operator_key_pem, str) else operator_key_pem,
+        password=None,
+    )
+    reg_sig = operator_privkey.sign(reg_payload)
+
+    # Verify operator's signature (proves we have the right operator key)
+    op_pubkey = serialization.load_pem_public_key(
+        op_pubkey_pem.encode() if isinstance(op_pubkey_pem, str) else op_pubkey_pem
+    )
+    try:
+        op_pubkey.verify(reg_sig, reg_payload)
+    except Exception as e:
+        return False, f"Operator signature verification failed: {e}"
+
+    # Store agent
+    with _db_lock:
+        conn = _get_db()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO agents (name, identity, public_key, role, registered_by, created_at) "
+                "VALUES (?, ?, ?, 'agent', ?, ?)",
+                (agent_name, identity_str, agent_pubkey_pem, operator_name, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return True, f"Agent '{agent_name}' registered by operator '{operator_name}'"
+
+
+def _list_agents():
+    """List all registered agents."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT name, identity, role, registered_by, created_at FROM agents ORDER BY created_at"
+        ).fetchall()
+        return [
+            {
+                'name': r[0],
+                'identity': r[1],
+                'role': r[2],
+                'registered_by': r[3],
+                'created_at': r[4],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+# --- Message Operations ---
+
+def _send_message(channel, sender, content, signature=''):
     """Insert a message into the buffer. Returns the message ID."""
     with _db_lock:
         conn = _get_db()
         try:
             cursor = conn.execute(
-                "INSERT INTO messages (channel, sender, content, created_at) VALUES (?, ?, ?, ?)",
-                (channel, sender, content, time.time()),
+                "INSERT INTO messages (channel, sender, content, created_at, signature) VALUES (?, ?, ?, ?, ?)",
+                (channel, sender, content, time.time(), signature),
             )
             msg_id = cursor.lastrowid
             conn.commit()
@@ -82,16 +311,14 @@ def _read_messages(channel, agent, mark_read=True):
     with _db_lock:
         conn = _get_db()
         try:
-            # Get watermark
             row = conn.execute(
                 "SELECT last_id FROM watermarks WHERE agent = ? AND channel = ?",
                 (agent, channel),
             ).fetchone()
             last_id = row[0] if row else 0
 
-            # Get messages after watermark
             rows = conn.execute(
-                "SELECT id, sender, content, created_at FROM messages "
+                "SELECT id, sender, content, created_at, signature FROM messages "
                 "WHERE channel = ? AND id > ? ORDER BY id ASC",
                 (channel, last_id),
             ).fetchall()
@@ -102,16 +329,18 @@ def _read_messages(channel, agent, mark_read=True):
             messages = []
             max_id = last_id
             for row in rows:
-                messages.append({
+                msg = {
                     'id': row[0],
                     'sender': row[1],
                     'content': row[2],
                     'timestamp': row[3],
-                })
+                }
+                if row[4]:
+                    msg['signed'] = True
+                messages.append(msg)
                 if row[0] > max_id:
                     max_id = row[0]
 
-            # Advance watermark
             if mark_read and max_id > last_id:
                 conn.execute(
                     "INSERT OR REPLACE INTO watermarks (agent, channel, last_id) VALUES (?, ?, ?)",
@@ -172,7 +401,7 @@ def _notify_waiters():
 class IPCHandler(BaseHTTPRequestHandler):
 
     def _check_auth(self):
-        """Verify API key if configured. Returns True if authorized."""
+        """Verify API key if configured (legacy auth). Returns True if authorized."""
         if not API_KEY:
             return True
         auth = self.headers.get('Authorization', '')
@@ -182,30 +411,76 @@ class IPCHandler(BaseHTTPRequestHandler):
         return False
 
     def do_POST(self):
-        """POST /send — send a message."""
         try:
             if not self._check_auth():
                 return
+            path = self.path.split('?')[0]
             length = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(length))
 
-            channel = body.get('channel', '')
-            sender = body.get('sender', '')
-            content = body.get('content', '')
-
-            if not channel or not sender or not content:
-                self._json_response(400, {'error': 'channel, sender, and content required'})
-                return
-
-            msg_id = _send_message(channel, sender, content)
-            self._json_response(200, {'ok': True, 'id': msg_id})
+            if path == '/send':
+                self._handle_send(body)
+            elif path == '/register':
+                self._handle_register(body)
+            else:
+                self._json_response(404, {'error': 'not found'})
 
         except Exception as e:
             sys.stderr.write(f"[ipc-server] POST error: {e}\n")
             self._json_response(500, {'error': str(e)})
 
+    def _handle_send(self, body):
+        """POST /send — send a message (with signature verification in secure mode)."""
+        channel = body.get('channel', '')
+        sender = body.get('sender', '')
+        content = body.get('content', '')
+        signature = body.get('signature', '')
+
+        if not channel or not sender or not content:
+            self._json_response(400, {'error': 'channel, sender, and content required'})
+            return
+
+        # Identity verification in secure mode
+        if _is_secure_mode():
+            if not signature:
+                self._json_response(403, {'error': 'signature required (secure mode active)'})
+                return
+            pubkey_pem, _ = _get_agent_pubkey(sender)
+            if not pubkey_pem:
+                self._json_response(403, {'error': f'unknown sender: {sender}'})
+                return
+            if not _verify_signature(channel, sender, content, signature, pubkey_pem):
+                self._json_response(403, {'error': 'invalid signature'})
+                return
+
+        msg_id = _send_message(channel, sender, content, signature)
+        self._json_response(200, {'ok': True, 'id': msg_id})
+
+    def _handle_register(self, body):
+        """POST /register — register a new agent (requires operator key)."""
+        if not HAS_CRYPTO:
+            self._json_response(500, {'error': 'cryptography package not installed on server'})
+            return
+
+        agent_name = body.get('name', '')
+        pubkey_pem = body.get('public_key', '')
+        identity_str = body.get('identity', '')
+        operator_name = body.get('operator', '')
+        operator_key_pem = body.get('operator_key', '')
+
+        if not agent_name or not pubkey_pem or not operator_name or not operator_key_pem:
+            self._json_response(400, {
+                'error': 'name, public_key, operator, and operator_key required'
+            })
+            return
+
+        ok, msg = _register_agent(agent_name, pubkey_pem, identity_str, operator_name, operator_key_pem)
+        if ok:
+            self._json_response(200, {'ok': True, 'message': msg})
+        else:
+            self._json_response(403, {'error': msg})
+
     def do_GET(self):
-        """GET /messages, /channels, /health."""
         try:
             if not self._check_auth():
                 return
@@ -216,6 +491,8 @@ class IPCHandler(BaseHTTPRequestHandler):
                 self._handle_messages(params)
             elif path == '/channels':
                 self._handle_channels()
+            elif path == '/agents':
+                self._handle_agents()
             elif path == '/health':
                 self._handle_health(params)
             else:
@@ -226,8 +503,8 @@ class IPCHandler(BaseHTTPRequestHandler):
 
     def _handle_messages(self, params):
         """GET /messages?channel=X&agent=Y[&wait=true]"""
-        channel = params.get('channel', '')
-        agent = params.get('agent', '')
+        channel = unquote(params.get('channel', ''))
+        agent = unquote(params.get('agent', ''))
         wait = params.get('wait', '').lower() == 'true'
 
         if not channel or not agent:
@@ -256,11 +533,17 @@ class IPCHandler(BaseHTTPRequestHandler):
         channels = _list_channels()
         self._json_response(200, channels)
 
+    def _handle_agents(self):
+        """GET /agents — list registered agents (public keys + roles)."""
+        agents = _list_agents()
+        self._json_response(200, agents)
+
     def _handle_health(self, params):
-        channel = params.get('channel', '')
-        agent = params.get('agent', '')
+        channel = unquote(params.get('channel', ''))
+        agent = unquote(params.get('agent', ''))
         pending = _pending_count(channel, agent) if channel and agent else 0
-        self._json_response(200, {'status': 'ok', 'pending': pending})
+        secure = _is_secure_mode()
+        self._json_response(200, {'status': 'ok', 'pending': pending, 'secure_mode': secure})
 
     def _json_response(self, code, data):
         body = json.dumps(data).encode()
@@ -288,12 +571,51 @@ class IPCHandler(BaseHTTPRequestHandler):
 
 def cli_send(args):
     """Send a message via direct DB write (no server needed)."""
-    if len(args) < 3:
-        print("Usage: ipc-server.py send <channel> <from> <message>", file=sys.stderr)
+    # Parse --key flag
+    key_file = None
+    clean_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == '--key' and i + 1 < len(args):
+            key_file = args[i + 1]
+            i += 2
+        else:
+            clean_args.append(args[i])
+            i += 1
+
+    if len(clean_args) < 3:
+        print("Usage: ipc-server.py send <channel> <from> <message> [--key <keyfile>]", file=sys.stderr)
         sys.exit(1)
-    channel, sender, content = args[0], args[1], ' '.join(args[2:])
-    msg_id = _send_message(channel, sender, content)
-    print(json.dumps({'ok': True, 'id': msg_id, 'channel': channel}))
+
+    channel, sender, content = clean_args[0], clean_args[1], ' '.join(clean_args[2:])
+
+    signature = ''
+
+    # In secure mode, signing is required
+    if _is_secure_mode():
+        if not key_file:
+            print("Error: secure mode active — --key <private-key-file> required", file=sys.stderr)
+            sys.exit(1)
+        with open(key_file, 'r') as f:
+            private_pem = f.read()
+        signature = _sign_message(channel, sender, content, private_pem)
+
+        # Verify against stored public key
+        pubkey_pem, _ = _get_agent_pubkey(sender)
+        if not pubkey_pem:
+            print(f"Error: unknown sender '{sender}' — not registered", file=sys.stderr)
+            sys.exit(1)
+        if not _verify_signature(channel, sender, content, signature, pubkey_pem):
+            print("Error: signature does not match registered public key", file=sys.stderr)
+            sys.exit(1)
+    elif key_file:
+        # Optional signing in open mode
+        with open(key_file, 'r') as f:
+            private_pem = f.read()
+        signature = _sign_message(channel, sender, content, private_pem)
+
+    msg_id = _send_message(channel, sender, content, signature)
+    print(json.dumps({'ok': True, 'id': msg_id, 'channel': channel, 'signed': bool(signature)}))
 
 
 def cli_read(args):
@@ -325,13 +647,118 @@ def cli_channels(args):
     print(json.dumps(channels, indent=2))
 
 
+def cli_seed(args):
+    """Seed an operator: generate keypair, store public key, print private key."""
+    if len(args) < 1:
+        print("Usage: ipc-server.py seed <operator-name>", file=sys.stderr)
+        sys.exit(1)
+
+    name = args[0]
+    try:
+        private_pem, public_pem = _seed_operator(name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Output the private key — user must save this
+    sys.stderr.write(f"[ipc] Operator '{name}' seeded. Public key stored in DB.\n")
+    sys.stderr.write(f"[ipc] SAVE THE PRIVATE KEY BELOW — it cannot be recovered.\n\n")
+    print(private_pem)
+
+
+def cli_keygen(args):
+    """Generate an Ed25519 keypair (utility, does not register anything)."""
+    out_prefix = None
+    i = 0
+    while i < len(args):
+        if args[i] == '--out' and i + 1 < len(args):
+            out_prefix = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    private_pem, public_pem = _keygen()
+
+    if out_prefix:
+        key_path = f"{out_prefix}.key"
+        pub_path = f"{out_prefix}.pub"
+        with open(key_path, 'w') as f:
+            f.write(private_pem)
+        os.chmod(key_path, 0o600)
+        with open(pub_path, 'w') as f:
+            f.write(public_pem)
+        sys.stderr.write(f"[ipc] Private key: {key_path} (chmod 600)\n")
+        sys.stderr.write(f"[ipc] Public key:  {pub_path}\n")
+    else:
+        sys.stderr.write("--- PRIVATE KEY ---\n")
+        print(private_pem)
+        sys.stderr.write("--- PUBLIC KEY ---\n")
+        print(public_pem)
+
+
+def cli_register(args):
+    """Register an agent, authorized by an operator's private key."""
+    # Parse flags
+    agent_name = args[0] if args else ''
+    pubkey_file = identity_str = operator_name = operator_key_file = ''
+
+    i = 1
+    while i < len(args):
+        if args[i] == '--pubkey' and i + 1 < len(args):
+            pubkey_file = args[i + 1]
+            i += 2
+        elif args[i] == '--identity' and i + 1 < len(args):
+            identity_str = args[i + 1]
+            i += 2
+        elif args[i] == '--as' and i + 1 < len(args):
+            operator_name = args[i + 1]
+            i += 2
+        elif args[i] == '--key' and i + 1 < len(args):
+            operator_key_file = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if not agent_name or not pubkey_file or not operator_name or not operator_key_file:
+        print("Usage: ipc-server.py register <name> --pubkey <file> --as <operator> --key <keyfile> [--identity <str>]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    with open(pubkey_file, 'r') as f:
+        agent_pubkey_pem = f.read().strip()
+    with open(operator_key_file, 'r') as f:
+        operator_key_pem = f.read().strip()
+
+    ok, msg = _register_agent(agent_name, agent_pubkey_pem, identity_str, operator_name, operator_key_pem)
+    if ok:
+        print(json.dumps({'ok': True, 'message': msg}))
+    else:
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cli_agents(args):
+    """List all registered agents."""
+    agents = _list_agents()
+    if not agents:
+        print("No agents registered (open mode — anyone can send)")
+        return
+    for a in agents:
+        role_tag = f"[{a['role']}]"
+        reg = f" (registered by {a['registered_by']})" if a['registered_by'] else ""
+        ident = f" id={a['identity']}" if a['identity'] else ""
+        print(f"  {role_tag:10s} {a['name']}{ident}{reg}")
+
+
 def cli_serve(args):
     """Start the HTTP server."""
     port = int(args[0]) if args else DEFAULT_PORT
-    _get_db()  # Initialize DB
+    _get_db()  # Initialize DB + migrations
+    secure = _is_secure_mode()
     server = HTTPServer(('0.0.0.0', port), IPCHandler)
     sys.stderr.write(f"[ipc-server] Listening on 0.0.0.0:{port}\n")
     sys.stderr.write(f"[ipc-server] DB: {DB_PATH}\n")
+    sys.stderr.write(f"[ipc-server] Security: {'ACTIVE (Ed25519)' if secure else 'OPEN (no operators seeded)'}\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -341,25 +768,26 @@ def cli_serve(args):
 
 # --- Main ---
 
+COMMANDS = {
+    'serve': cli_serve,
+    'send': cli_send,
+    'read': cli_read,
+    'channels': cli_channels,
+    'seed': cli_seed,
+    'keygen': cli_keygen,
+    'register': cli_register,
+    'agents': cli_agents,
+}
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: ipc-server.py <serve|send|read|channels> [args...]", file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        cmds = '|'.join(COMMANDS.keys())
+        print(f"Usage: ipc-server.py <{cmds}> [args...]", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
-    args = sys.argv[2:]
-
-    if cmd == 'serve':
-        cli_serve(args)
-    elif cmd == 'send':
-        cli_send(args)
-    elif cmd == 'read':
-        cli_read(args)
-    elif cmd == 'channels':
-        cli_channels(args)
-    else:
-        print(f"Unknown command: {cmd}", file=sys.stderr)
-        sys.exit(1)
+    COMMANDS[cmd](sys.argv[2:])
 
 
 if __name__ == '__main__':
