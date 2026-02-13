@@ -124,6 +124,7 @@ Remote   ---[HTTPS POST /send]--------'
 | `/channels` | GET | List all channels with message counts |
 | `/agents` | GET | List registered agents (names, roles, identities) |
 | `/health` | GET | Status + pending count + secure mode flag |
+| `/.well-known/agent-card.json` | GET | A2A Agent Card — identity, capabilities, DID:key |
 
 ## Identity Verification
 
@@ -148,6 +149,27 @@ python3 sources.d/ipc-server.py seed ops-team-1 > ops1.key
 python3 sources.d/ipc-server.py seed ops-team-2 > ops2.key
 ```
 
+## Agent Discovery (A2A)
+
+The server hosts an [Agent Card](https://google.github.io/A2A/) at `/.well-known/agent-card.json`, making it discoverable by other agents following the Agent2Agent Protocol.
+
+```bash
+# Via HTTP
+curl http://localhost:9876/.well-known/agent-card.json
+
+# Via CLI
+python3 sources.d/ipc-server.py agent-card
+```
+
+If an operator has been seeded, the card automatically includes a [DID:key](https://w3c-ccg.github.io/did-method-key/) identifier derived from the operator's Ed25519 public key. Configure the card via environment variables:
+
+```bash
+IPC_AGENT_NAME="Herald" \
+IPC_AGENT_DESC="Persistent bot with long-term memory" \
+IPC_AGENT_URL="https://my-agent.ngrok.io" \
+python3 sources.d/ipc-server.py serve
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -155,6 +177,9 @@ python3 sources.d/ipc-server.py seed ops-team-2 > ops2.key
 | `IPC_DB_PATH` | `/tmp/el-ipc.db` | SQLite database path |
 | `IPC_PORT` | `9876` | HTTP server port |
 | `IPC_API_KEY` | *(none)* | Legacy API key auth (pre-identity, still works alongside Ed25519) |
+| `IPC_AGENT_NAME` | `el-ipc agent` | Agent name in the A2A Agent Card |
+| `IPC_AGENT_DESC` | *(generic)* | Agent description in the A2A Agent Card |
+| `IPC_AGENT_URL` | `http://localhost:{port}` | Public URL in the Agent Card (set to your ngrok URL) |
 
 ## CLI Commands
 
@@ -168,6 +193,7 @@ python3 sources.d/ipc-server.py seed ops-team-2 > ops2.key
 | `keygen [--out <prefix>]` | Generate Ed25519 keypair (utility) |
 | `register <name> --pubkey <f> --as <op> --key <f> [--identity <s>]` | Register agent |
 | `agents` | List registered agents |
+| `agent-card` | Print A2A Agent Card JSON |
 
 ## Using with el
 
