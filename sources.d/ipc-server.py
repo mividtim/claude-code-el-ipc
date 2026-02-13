@@ -18,6 +18,7 @@ Usage:
     Keygen:       python3 ipc-server.py keygen [--out <prefix>]
     Register:     python3 ipc-server.py register <name> --pubkey <file> --as <operator> --key <keyfile> [--identity <str>]
     Agents:       python3 ipc-server.py agents
+    Agent Card:   python3 ipc-server.py agent-card
 
 Env vars:
     IPC_DB_PATH   - SQLite database path (default: /tmp/el-ipc.db)
@@ -51,6 +52,9 @@ except ImportError:
 DB_PATH = os.environ.get('IPC_DB_PATH', '/tmp/el-ipc.db')
 DEFAULT_PORT = int(os.environ.get('IPC_PORT', '9876'))
 API_KEY = os.environ.get('IPC_API_KEY', '')  # Legacy auth (pre-identity)
+AGENT_CARD_NAME = os.environ.get('IPC_AGENT_NAME', '')
+AGENT_CARD_DESC = os.environ.get('IPC_AGENT_DESC', '')
+AGENT_CARD_URL = os.environ.get('IPC_AGENT_URL', '')
 
 # --- Database ---
 
@@ -215,6 +219,79 @@ def _keygen():
     ).decode()
 
     return private_pem, public_pem
+
+
+# --- DID:key (W3C) ---
+# Converts Ed25519 public keys to did:key:z... identifiers.
+# Base58btc encoding with Ed25519 multicodec prefix (0xed01).
+
+_B58_ALPHABET = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+_ED25519_MULTICODEC = bytes([0xed, 0x01])
+_ED25519_SPKI_PREFIX = bytes([
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+    0x03, 0x21, 0x00
+])
+
+
+def _b58_encode(data: bytes) -> str:
+    """Base58btc encode raw bytes."""
+    num = int.from_bytes(data, 'big')
+    result = []
+    while num > 0:
+        num, remainder = divmod(num, 58)
+        result.append(_B58_ALPHABET[remainder:remainder + 1])
+    for byte in data:
+        if byte == 0:
+            result.append(_B58_ALPHABET[0:1])
+        else:
+            break
+    return b''.join(reversed(result)).decode('ascii')
+
+
+def _pem_to_raw_pubkey(pem_text: str) -> bytes:
+    """Extract raw 32-byte Ed25519 public key from PEM (SubjectPublicKeyInfo)."""
+    lines = [l for l in pem_text.strip().splitlines() if not l.startswith('-----')]
+    der = base64.b64decode(''.join(lines))
+    if der[:len(_ED25519_SPKI_PREFIX)] == _ED25519_SPKI_PREFIX:
+        return der[len(_ED25519_SPKI_PREFIX):]
+    raise ValueError("Not an Ed25519 SubjectPublicKeyInfo PEM")
+
+
+def _pubkey_to_did(raw_pubkey: bytes) -> str:
+    """Convert raw 32-byte Ed25519 public key to did:key identifier."""
+    multicodec_key = _ED25519_MULTICODEC + raw_pubkey
+    return f"did:key:z{_b58_encode(multicodec_key)}"
+
+
+def _build_agent_card(name: str, description: str, endpoint: str,
+                      did: str | None = None, skills: list | None = None) -> dict:
+    """Build an A2A Agent Card (/.well-known/agent-card.json)."""
+    card: dict = {
+        "name": name,
+        "description": description,
+        "url": endpoint,
+        "version": "1.0.0",
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+        },
+        "authentication": {
+            "schemes": ["Ed25519Signature"]
+        },
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": skills or [
+            {
+                "id": "ipc",
+                "name": "Inter-Agent Messaging",
+                "description": "Send and receive signed messages via el-ipc",
+                "tags": ["ipc", "messaging", "ed25519"]
+            }
+        ]
+    }
+    if did:
+        card["did"] = did
+    return card
 
 
 def _register_agent(agent_name, agent_pubkey_pem, identity_str, operator_name, operator_key_pem):
@@ -495,6 +572,8 @@ class IPCHandler(BaseHTTPRequestHandler):
                 self._handle_agents()
             elif path == '/health':
                 self._handle_health(params)
+            elif path == '/.well-known/agent-card.json':
+                self._handle_agent_card()
             else:
                 self._json_response(404, {'error': 'not found'})
         except Exception as e:
@@ -544,6 +623,31 @@ class IPCHandler(BaseHTTPRequestHandler):
         pending = _pending_count(channel, agent) if channel and agent else 0
         secure = _is_secure_mode()
         self._json_response(200, {'status': 'ok', 'pending': pending, 'secure_mode': secure})
+
+    def _handle_agent_card(self):
+        """GET /.well-known/agent-card.json — A2A Agent Card with DID:key."""
+        name = AGENT_CARD_NAME or 'el-ipc agent'
+        description = AGENT_CARD_DESC or 'An el-ipc agent with Ed25519 identity'
+        endpoint = AGENT_CARD_URL or f'http://localhost:{DEFAULT_PORT}'
+
+        # Try to derive DID:key from the first operator's public key
+        did = None
+        conn = _get_db()
+        try:
+            row = conn.execute(
+                "SELECT public_key FROM agents WHERE role = 'operator' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if row:
+                try:
+                    raw = _pem_to_raw_pubkey(row[0])
+                    did = _pubkey_to_did(raw)
+                except Exception:
+                    pass  # No DID if key can't be parsed
+        finally:
+            conn.close()
+
+        card = _build_agent_card(name, description, endpoint, did=did)
+        self._json_response(200, card)
 
     def _json_response(self, code, data):
         body = json.dumps(data).encode()
@@ -750,6 +854,31 @@ def cli_agents(args):
         print(f"  {role_tag:10s} {a['name']}{ident}{reg}")
 
 
+def cli_agent_card(args):
+    """Print the A2A Agent Card JSON."""
+    name = AGENT_CARD_NAME or 'el-ipc agent'
+    description = AGENT_CARD_DESC or 'An el-ipc agent with Ed25519 identity'
+    endpoint = AGENT_CARD_URL or f'http://localhost:{DEFAULT_PORT}'
+
+    did = None
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT public_key FROM agents WHERE role = 'operator' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row:
+            try:
+                raw = _pem_to_raw_pubkey(row[0])
+                did = _pubkey_to_did(raw)
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    card = _build_agent_card(name, description, endpoint, did=did)
+    print(json.dumps(card, indent=2))
+
+
 def cli_serve(args):
     """Start the HTTP server."""
     port = int(args[0]) if args else DEFAULT_PORT
@@ -777,6 +906,7 @@ COMMANDS = {
     'keygen': cli_keygen,
     'register': cli_register,
     'agents': cli_agents,
+    'agent-card': cli_agent_card,
 }
 
 
