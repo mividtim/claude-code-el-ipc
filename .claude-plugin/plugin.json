@@ -1,0 +1,12 @@
+{
+  "name": "el-ipc",
+  "version": "1.0.0",
+  "description": "Inter-agent IPC sidecar plugin for el. SQLite-backed message queue with Ed25519 identity verification. Receives messages as sidecar events through the drain. Self-registers with el-sidecar v0.9.0+.",
+  "author": {
+    "name": "Tim Garthwaite",
+    "url": "https://github.com/mividtim"
+  },
+  "repository": "https://github.com/mividtim/claude-code-el-ipc",
+  "license": "MIT",
+  "keywords": ["el", "ipc", "messaging", "ed25519", "a2a", "inter-agent"]
+}
