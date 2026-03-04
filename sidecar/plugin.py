@@ -112,6 +112,30 @@ def _get_agent_pubkey(conn, name):
     return (row[0], row[1]) if row else (None, None)
 
 
+def _emit_security_alert(alert_type, sender, channel, detail=''):
+    """Emit a security alert event to the drain for operator visibility."""
+    if not _api.get('insert_event'):
+        return
+    text = f"[SECURITY] {alert_type}: sender={sender}, channel={channel}"
+    if detail:
+        text += f" — {detail}"
+    sys.stderr.write(f"[el-ipc] {text}\n")
+    _api['insert_event'](
+        source='ipc',
+        type='security_alert',
+        text=text,
+        user_id=sender,
+        channel=channel,
+        metadata={
+            'alert_type': alert_type,
+            'sender': sender,
+            'channel': channel,
+            'detail': detail,
+        },
+    )
+    _api['notify_waiters']()
+
+
 # ===================================================================
 # DID:key (W3C)
 # ===================================================================
@@ -268,16 +292,22 @@ def _handle_send(handler):
             secure = _is_secure_mode(conn)
             if secure:
                 if not signature:
+                    _emit_security_alert('unsigned_message', sender, channel,
+                                         'message sent without signature in secure mode')
                     handler._send_json(
                         {"error": "signature required (secure mode active)"}, 403)
                     return
                 pubkey_pem, _ = _get_agent_pubkey(conn, sender)
                 if not pubkey_pem:
+                    _emit_security_alert('unknown_sender', sender, channel,
+                                         'sender not registered in agent registry')
                     handler._send_json(
                         {"error": f"unknown sender: {sender}"}, 403)
                     return
                 if not _verify_signature(channel, sender, content,
                                          signature, pubkey_pem):
+                    _emit_security_alert('invalid_signature', sender, channel,
+                                         'signature verification failed')
                     handler._send_json({"error": "invalid signature"}, 403)
                     return
 
@@ -394,6 +424,9 @@ def _handle_register(handler):
                     conn, agent_name, pubkey_pem, identity_str,
                     operator_name, operator_key_pem)
                 if not ok:
+                    _emit_security_alert('unauthorized_registration',
+                                         operator_name or 'unknown', agent_name,
+                                         msg)
                     handler._send_json({"error": msg}, 403)
                     return
                 handler._send_json({"ok": True, "message": msg})
